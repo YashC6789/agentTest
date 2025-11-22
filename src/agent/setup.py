@@ -1,0 +1,83 @@
+"""Agent setup and execution."""
+
+from langchain.agents import create_agent as create_langchain_agent
+from langchain_ollama import ChatOllama
+from langchain_core.messages import SystemMessage, HumanMessage
+
+from ..config.settings import Settings
+from ..config.prompts import SYSTEM_PROMPT, BASE_QUERY
+from .tools import add, subtract, multiply, divide, search, get_weather
+from .middleware import handle_tool_errors
+
+
+def create_agent(settings: Settings = None) -> object:
+    """
+    Create and configure a LangChain agent.
+    
+    Args:
+        settings: Configuration settings (uses defaults if None)
+        
+    Returns:
+        Configured LangChain agent
+    """
+    settings = settings or Settings()
+    
+    llm = ChatOllama(model=settings.model_name)
+    
+    agent = create_langchain_agent(
+        model=llm,
+        tools=[search, get_weather, add, subtract, multiply, divide],
+        middleware=[handle_tool_errors]
+    )
+    
+    return agent
+
+
+def run_agent_with_suffix(
+    agent: object,
+    suffix: str,
+    system_prompt: str = None,
+    base_query: str = None,
+    user_role: str = None,
+    settings: Settings = None
+) -> str:
+    """
+    Call the agent with a base query plus adversarial suffix.
+    
+    Args:
+        agent: The LangChain agent to use
+        suffix: Adversarial suffix to append to base query
+        system_prompt: System prompt (uses default if None)
+        base_query: Base query (uses default if None)
+        user_role: User role for context (uses settings default if None)
+        settings: Configuration settings (uses defaults if None)
+        
+    Returns:
+        Agent's final answer as a string
+    """
+    settings = settings or Settings()
+    system_prompt = system_prompt or SYSTEM_PROMPT
+    base_query = base_query or BASE_QUERY
+    user_role = user_role or settings.user_role
+    
+    user_text = base_query + " " + suffix if suffix else base_query
+    
+    result = agent.invoke(
+        {
+            "messages": [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_text),
+            ]
+        },
+        context={"user_role": user_role},
+    )
+    
+    # result["messages"] is a list of messages, last one is AI's reply
+    last_msg = result["messages"][-1]
+    # content can be str or list; handle both
+    if isinstance(last_msg.content, str):
+        return last_msg.content
+    else:
+        # e.g. list of parts; join text parts
+        return " ".join(str(part) for part in last_msg.content)
+
