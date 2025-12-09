@@ -32,6 +32,18 @@ def create_agent(settings: Settings = None) -> object:
     
     return agent
 
+def build_tool_agent(tools_list, model="llama3.2:latest", temp=0.1):
+    """
+    Builds a standard tool-calling agent.
+    Temperature is low (0.1) to simulate a robust, deterministic victim.
+    """
+    llm = ChatOllama(model=model, temperature=temp)
+
+    agent = create_langchain_agent(model=llm, tools=tools_list, middleware=[handle_tool_errors])
+    
+    # max_iterations prevents infinite loops if the attack succeeds too well
+    return agent
+
 
 def run_agent_with_suffix(
     agent: object,
