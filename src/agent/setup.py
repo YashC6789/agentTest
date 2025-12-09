@@ -32,7 +32,7 @@ def create_agent(settings: Settings = None) -> object:
     
     return agent
 
-def build_tool_agent(tools_list, model="llama3.2:latest", temp=0.1):
+def build_tool_agent(tools_list, model="llama3.1:8b", temp=0.1):
     """
     Builds a standard tool-calling agent.
     Temperature is low (0.1) to simulate a robust, deterministic victim.
