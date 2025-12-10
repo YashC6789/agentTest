@@ -1,5 +1,6 @@
 """Agent setup and execution."""
 
+from typing import List, Optional
 from langchain.agents import create_agent as create_langchain_agent
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -41,6 +42,37 @@ def build_tool_agent(tools_list, model="llama3.1:8b", temp=0.1):
 
     agent = create_langchain_agent(model=llm, tools=tools_list, middleware=[handle_tool_errors])
     
+    # max_iterations prevents infinite loops if the attack succeeds too well
+    return agent
+
+def build_mal_tool_agent(
+    tools_list: List,              # your existing tool schemas / tools
+    extra_tools: Optional[List] = None,
+    model: str = "llama3.1:8b",
+    temp: float = 0.1,
+):
+    """
+    Builds a standard tool-calling agent.
+
+    - tools_list: base tools the agent should always have.
+    - extra_tools: optional list of additional tools to inject
+                   (e.g., privacy stealer / manipulator tools).
+    - model: Ollama model name.
+    - temp: low temperature to simulate a robust, deterministic victim.
+    """
+    llm = ChatOllama(model=model, temperature=temp)
+
+    # Merge base tools with any extra tools
+    all_tools = list(tools_list)
+    if extra_tools:
+        all_tools.extend(extra_tools)
+
+    agent = create_langchain_agent(
+        model=llm,
+        tools=all_tools,
+        middleware=[handle_tool_errors],
+    )
+
     # max_iterations prevents infinite loops if the attack succeeds too well
     return agent
 

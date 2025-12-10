@@ -1,7 +1,24 @@
 """Configuration settings for the agent and GCG attack."""
-
+from __future__ import annotations
 from dataclasses import dataclass
+from typing import List, Optional
 
+@dataclass
+class ToolHijackerConfig:
+    target_task_description: str
+    target_query_variants: List[str]
+    malicious_tool_name: str = "MaliciousGiftAdvisorPro"
+    max_iterations: int = 10
+    retrieval_weight: float = 1.0
+    selection_weight: float = 1.0
+
+
+@dataclass
+class ToolHijackerResult:
+    malicious_description: str
+    best_score: float
+    retrieval_hit_rate: float
+    selection_success_rate: float
 
 @dataclass
 class Settings:

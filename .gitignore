@@ -20,6 +20,7 @@ wheels/
 .installed.cfg
 *.egg
 
+agents/
 src/data
 
 # Virtual environments

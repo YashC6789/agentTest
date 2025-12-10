@@ -7,8 +7,9 @@ from typing import List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.documents import Document
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
 
 # Local Imports
 from src.agent.setup import build_tool_agent
@@ -21,8 +22,11 @@ from toolbench import api_json_to_openai_json, standardize
 # Adjust if your tools live elsewhere
 TOOL_ROOT_DIR = os.path.join("src", "data", "toolbench", "tools")
 
-# How many tools to pass to the main agent per query
+# How many tools to pass to the main agent per query (final stage)
 TOOL_TOP_K = int(os.getenv("TOOL_TOP_K", "8"))
+
+# How many tools BM25 should keep as candidates in stage 1
+TOOL_STAGE1_K = int(os.getenv("TOOL_STAGE1_K", "256"))
 
 # Ollama embedding model (must be available in your local Ollama server)
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
@@ -149,69 +153,98 @@ def load_some_tool_schemas(
     return tool_schemas
 
 
-# ------------------------ TOOL RETRIEVER (OLLAMA) ------------------------ #
+# ------------------------ TWO-STAGE TOOL RETRIEVER ------------------------ #
 
-class ToolRetriever:
+class ToolRetriever2Stage:
     """
-    Builds a vector index over tool schemas using Ollama embeddings.
-    Given a natural language query (the user's prompt), returns the top-k
-    most relevant tools to pass to the main tool-calling agent.
+    Stage 1: BM25 over all tool schemas (fast, lexical).
+    Stage 2: Ollama embeddings over the BM25 candidates (semantic rerank).
+    Returns the top-k tool schemas for a given query.
     """
 
     def __init__(
         self,
         tool_schemas: List[Dict[str, Any]],
         embedding_model: str = OLLAMA_EMBED_MODEL,
+        stage1_k: int = TOOL_STAGE1_K,
     ):
         if not tool_schemas:
-            raise ValueError("ToolRetriever requires a non-empty list of tool_schemas")
+            raise ValueError("ToolRetriever2Stage requires a non-empty list of tool_schemas")
 
         self.tool_schemas = tool_schemas
         self.embedding_model_name = embedding_model
-        self.embedding = OllamaEmbeddings(model=self.embedding_model_name)
+        self.stage1_k = max(1, stage1_k)
 
-        texts: List[str] = []
-        metadatas: List[Dict[str, Any]] = []
+        # Build BM25 corpus
+        docs: List[Document] = []
 
         for t in tool_schemas:
-            # ToolBench/OpenAI tool schema usually looks like:
-            # {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
             fn = t.get("function", {})
             name = fn.get("name", t.get("name", "unknown_tool"))
             description = fn.get("description", "") or t.get("description", "")
-            # Fallback: at least index the name if description is missing
-            text = f"{name}: {description}" if description else name
 
-            texts.append(text)
-            metadatas.append(
-                {
-                    "name": name,
-                    "schema": t,
-                }
+            # Truncate description a bit to keep things lean
+            desc_short = description[:256]
+            text = f"{name}: {desc_short}" if desc_short else name
+
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={"name": name, "schema": t},
+                )
             )
 
-        print(f"[INFO] Building FAISS index over {len(texts)} tools using Ollama embeddings '{self.embedding_model_name}'")
-        self.vectorstore = FAISS.from_texts(
-            texts=texts,
-            embedding=self.embedding,
-            metadatas=metadatas,
-        )
+        print(f"[INFO] Building BM25 retriever over {len(docs)} tools")
+        self.bm25 = BM25Retriever.from_documents(docs)
+        self.bm25.k = self.stage1_k
+
+        print(f"[INFO] Initializing Ollama embeddings '{self.embedding_model_name}' for stage 2 reranking")
+        self.embedding = OllamaEmbeddings(model=self.embedding_model_name)
 
     def get_top_k_tools(self, query: str, k: int = TOOL_TOP_K) -> List[Dict[str, Any]]:
         """
-        Returns a list of tool schemas (same structure as input) corresponding
-        to the top-k most similar tools to the query.
+        Stage 1: BM25 -> get up to stage1_k candidate tools.
+        Stage 2: embed query + candidate texts with Ollama -> cosine similarity -> top-k.
+        Returns tool schemas for the final top-k.
         """
         if k <= 0:
             return []
 
-        docs = self.vectorstore.similarity_search(query, k=k)
-        selected: List[Dict[str, Any]] = []
+        # -------- Stage 1: BM25 lexical retrieval -------- #
+        candidates = self.bm25.invoke(query)  # uses self.bm25.k
 
-        for d in docs:
-            schema = d.metadata.get("schema")
-            if schema is not None:
-                selected.append(schema)
+        if not candidates:
+            return []
+
+        # -------- Stage 2: Ollama embedding rerank -------- #
+        candidate_texts = [d.page_content for d in candidates]
+        candidate_schemas = [d.metadata["schema"] for d in candidates]
+
+        # Embed query + candidate texts
+        query_emb = self.embedding.embed_query(query)
+        doc_embs = self.embedding.embed_documents(candidate_texts)
+
+        # Manual cosine similarity (no need for FAISS here)
+        def cosine(u, v):
+            # Avoid importing numpy just for this; simple Python implementation
+            num = sum(a * b for a, b in zip(u, v))
+            norm_u = sum(a * a for a in u) ** 0.5
+            norm_v = sum(b * b for b in v) ** 0.5
+            if norm_u == 0 or norm_v == 0:
+                return 0.0
+            return num / (norm_u * norm_v)
+
+        scored = [
+            (idx, cosine(query_emb, emb))
+            for idx, emb in enumerate(doc_embs)
+        ]
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Take top-k indices
+        top_indices = [idx for idx, _ in scored[:k]]
+
+        selected: List[Dict[str, Any]] = [candidate_schemas[i] for i in top_indices]
 
         # De-duplicate by name just in case
         seen = set()
@@ -394,7 +427,7 @@ def evaluate_tool_calls(test: Dict[str, Any], tool_calls: List[Dict[str, Any]]) 
     }
 
 
-# ------------------------ MAIN TEST HARNESS (WITH RETRIEVER) ------------------------ #
+# ------------------------ MAIN TEST HARNESS (WITH 2-STAGE RETRIEVER) ------------------------ #
 
 def run_tool_tests():
     # 1) Load tools from ToolBench
@@ -402,8 +435,12 @@ def run_tool_tests():
     tools_exposed = load_all_tool_schemas(TOOL_ROOT_DIR)
     print(f"[INFO] Loaded {len(tools_exposed)} tool schemas.\n")
 
-    # 2) Build retriever over ALL tools (using Ollama embeddings)
-    tool_retriever = ToolRetriever(tools_exposed, embedding_model=OLLAMA_EMBED_MODEL)
+    # 2) Build two-stage retriever over ALL tools
+    tool_retriever = ToolRetriever2Stage(
+        tools_exposed,
+        embedding_model=OLLAMA_EMBED_MODEL,
+        stage1_k=TOOL_STAGE1_K,
+    )
 
     results: List[Tuple[str, Dict[str, Any]]] = []
 
@@ -430,8 +467,8 @@ def run_tool_tests():
         system_content = (
             SYSTEM_PROMPT_TEXT
             + "\n\nYou have access to many external APIs drawn from ToolBench. "
-              "Before answering, a separate retriever has already selected a small "
-              f"subset of {len(top_k_tools)} tools that are most relevant to the user's query. "
+              "A separate retrieval stage has already selected a small subset of "
+              f"{len(top_k_tools)} tools that appear most relevant to the user's query. "
               "You MUST choose from these tools when they clearly apply to the user's request. "
               "For general chit-chat or simple reasoning (like jokes), "
               "answer directly without calling any tools."
